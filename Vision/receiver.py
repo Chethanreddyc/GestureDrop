@@ -3,6 +3,7 @@ import struct
 import os
 
 DISCOVERY_PORT = 5000
+SENDER_REPLY_PORT = 5002   # sender listens for replies on this port
 TCP_PORT = 5001
 BUFFER_SIZE = 4096
 SAVE_FOLDER = "received_screenshot"
@@ -10,26 +11,53 @@ SAVE_FOLDER = "received_screenshot"
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
 
+def get_own_ip():
+    """Get this machine's LAN IP address (not loopback)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # doesn't actually send data
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def start_receiver():
+
+    own_ip = get_own_ip()
+    print(f"[INFO] Receiver IP: {own_ip}")
 
     # ---- UDP LISTEN: wait for sender broadcast ----
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_socket.bind(('', DISCOVERY_PORT))
 
     print("[WAITING] Listening for sender broadcast...")
 
-    data, sender_addr = udp_socket.recvfrom(1024)
+    sender_ip = None
+    while True:
+        data, sender_addr = udp_socket.recvfrom(1024)
+        incoming_ip = sender_addr[0]
 
-    if data == b"SENDER_AVAILABLE":
-        sender_ip = sender_addr[0]
-        print(f"[DISCOVERED] Sender at {sender_ip}")
+        # *** KEY FIX: ignore broadcasts from ourselves ***
+        if incoming_ip == own_ip or incoming_ip == "127.0.0.1":
+            print(f"[SKIP] Ignoring broadcast from own IP: {incoming_ip}")
+            continue
 
-        udp_socket.sendto(b"RECEIVER_READY", sender_addr)   # FIX: was b"RECEIVE_READY"
+        if data == b"SENDER_AVAILABLE":
+            sender_ip = incoming_ip
+            print(f"[DISCOVERED] Sender at {sender_ip}")
+
+            # Reply to sender's dedicated reply port (5002), not back to port 5000
+            udp_socket.sendto(b"RECEIVER_READY", (sender_ip, SENDER_REPLY_PORT))
+            break
 
     udp_socket.close()
 
     # ---- TCP RECEIVE: accept the image ----
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(('', TCP_PORT))
     server_socket.listen(1)
 
@@ -42,7 +70,7 @@ def start_receiver():
 
     data = b""
     while len(data) < image_size:
-        packet = conn.recv(BUFFER_SIZE)   # FIX: was recvfrom() which returns a tuple
+        packet = conn.recv(BUFFER_SIZE)
         if not packet:
             break
         data += packet
