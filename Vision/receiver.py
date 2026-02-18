@@ -1,12 +1,13 @@
 import socket
 import struct
 import os
+import time
 
-DISCOVERY_PORT = 5000
-SENDER_REPLY_PORT = 5002   # sender listens for replies on this port
-TCP_PORT = 5001
-BUFFER_SIZE = 4096
-SAVE_FOLDER = "received_screenshot"
+BROADCAST_PORT  = 5000      # listen for sender's broadcast on this port
+TCP_PORT        = 5001      # connect to sender's TCP server on this port
+BUFFER_SIZE     = 4096
+SEARCH_TIMEOUT  = 15        # seconds to search for a sender before giving up
+SAVE_FOLDER     = "received_screenshot"
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
@@ -15,7 +16,7 @@ def get_own_ip():
     """Get this machine's LAN IP address (not loopback)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))  # doesn't actually send data
+        s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -24,68 +25,102 @@ def get_own_ip():
 
 
 def start_receiver():
+    """
+    New flow:
+      1. Listen for sender's IMAGE_READY broadcast
+      2. Ignore own broadcasts (self-loopback fix)
+      3. Connect to sender's TCP server
+      4. Pull image → save → open → reset
+    """
 
     own_ip = get_own_ip()
-    print(f"[INFO] Receiver IP: {own_ip}")
+    print(f"[RECEIVER] My IP: {own_ip}")
+    print(f"[RECEIVER] Searching for sender broadcast on port {BROADCAST_PORT}...")
 
-    # ---- UDP LISTEN: wait for sender broadcast ----
+    # ── UDP: search for sender broadcast ─────────────────────
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_socket.bind(('', DISCOVERY_PORT))
-
-    print("[WAITING] Listening for sender broadcast...")
+    udp_socket.bind(('', BROADCAST_PORT))
+    udp_socket.settimeout(SEARCH_TIMEOUT)
 
     sender_ip = None
-    while True:
-        data, sender_addr = udp_socket.recvfrom(1024)
-        incoming_ip = sender_addr[0]
+    try:
+        while True:
+            data, sender_addr = udp_socket.recvfrom(1024)
+            incoming_ip = sender_addr[0]
 
-        # *** KEY FIX: ignore broadcasts from ourselves ***
-        if incoming_ip == own_ip or incoming_ip == "127.0.0.1":
-            print(f"[SKIP] Ignoring broadcast from own IP: {incoming_ip}")
-            continue
+            # ── Self-loopback fix: ignore own broadcasts ──────
+            if incoming_ip == own_ip or incoming_ip == "127.0.0.1":
+                print(f"[RECEIVER] Ignoring own broadcast from {incoming_ip}")
+                continue
 
-        if data == b"SENDER_AVAILABLE":
-            sender_ip = incoming_ip
-            print(f"[DISCOVERED] Sender at {sender_ip}")
+            if data == b"IMAGE_READY":
+                sender_ip = incoming_ip
+                print(f"[RECEIVER] ✅ Found sender at {sender_ip}")
+                break
 
-            # Reply to sender's dedicated reply port (5002), not back to port 5000
-            udp_socket.sendto(b"RECEIVER_READY", (sender_ip, SENDER_REPLY_PORT))
-            break
+    except socket.timeout:
+        print(f"[RECEIVER] TIMEOUT — No sender found within {SEARCH_TIMEOUT}s. Resetting.")
+        udp_socket.close()
+        return  # ← reset
 
     udp_socket.close()
 
-    # ---- TCP RECEIVE: accept the image ----
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(('', TCP_PORT))
-    server_socket.listen(1)
+    # ── TCP: connect to sender and pull image ─────────────────
+    print(f"[RECEIVER] Connecting to sender {sender_ip}:{TCP_PORT}...")
 
-    print("[TCP] Waiting for image connection...")
-    conn, addr = server_socket.accept()
-    print(f"[CONNECTED] {addr}")
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.settimeout(10)
 
-    packed_size = conn.recv(8)
-    image_size = struct.unpack("Q", packed_size)[0]
+    try:
+        client_socket.connect((sender_ip, TCP_PORT))
+        print("[RECEIVER] Connected to sender.")
 
-    data = b""
-    while len(data) < image_size:
-        packet = conn.recv(BUFFER_SIZE)
-        if not packet:
-            break
-        data += packet
+        # Receive image size header (8 bytes)
+        packed_size = b""
+        while len(packed_size) < 8:
+            chunk = client_socket.recv(8 - len(packed_size))
+            if not chunk:
+                raise ConnectionError("Connection closed before size received.")
+            packed_size += chunk
 
-    file_path = os.path.join(SAVE_FOLDER, "received.png")
+        image_size = struct.unpack("Q", packed_size)[0]
+        print(f"[RECEIVER] Expecting {image_size} bytes...")
 
-    with open(file_path, "wb") as f:
-        f.write(data)
+        # Receive image data
+        data = b""
+        while len(data) < image_size:
+            packet = client_socket.recv(BUFFER_SIZE)
+            if not packet:
+                break
+            data += packet
 
-    print(f"[SUCCESS] Image received and saved to: {file_path}")
+        if len(data) == image_size:
+            # Save with timestamp so files don't overwrite each other
+            timestamp = int(time.time())
+            file_path = os.path.join(SAVE_FOLDER, f"received_{timestamp}.png")
 
-    conn.close()
-    server_socket.close()
+            with open(file_path, "wb") as f:
+                f.write(data)
 
-    os.startfile(file_path)
+            print(f"[RECEIVER] ✅ Image saved to: {file_path}")
+            os.startfile(file_path)
+
+        else:
+            print(f"[RECEIVER] ⚠️ Incomplete image: got {len(data)}/{image_size} bytes.")
+
+    except socket.timeout:
+        print("[RECEIVER] ERROR — Connection to sender timed out.")
+
+    except ConnectionError as e:
+        print(f"[RECEIVER] ERROR — {e}")
+
+    except Exception as e:
+        print(f"[RECEIVER] ERROR — Unexpected error: {e}")
+
+    finally:
+        client_socket.close()
+        print("[RECEIVER] Reset complete — ready for next gesture.")
 
 
 if __name__ == "__main__":

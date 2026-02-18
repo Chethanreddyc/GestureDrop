@@ -1,17 +1,20 @@
 import socket
 import struct
 import time
+import threading
 
-DISCOVERY_PORT = 5000
-TCP_PORT = 5001
-BUFFER_SIZE = 4096
+BROADCAST_PORT = 5000       # sender broadcasts on this port
+TCP_PORT       = 5001       # sender hosts image on this port
+BUFFER_SIZE    = 4096
+BROADCAST_INTERVAL = 1.0    # seconds between each broadcast
+HOSTING_TIMEOUT    = 60     # seconds to wait for a receiver before giving up
 
 
 def get_own_ip():
     """Get this machine's LAN IP address (not loopback)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))  # doesn't actually send data
+        s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -20,62 +23,80 @@ def get_own_ip():
 
 
 def start_sender(image_path):
+    """
+    New flow:
+      1. Take screenshot (already done by main.py before calling this)
+      2. Open a TCP server to host the image
+      3. Broadcast IMAGE_READY repeatedly until a receiver connects
+      4. Send image → close → reset
+    """
 
     own_ip = get_own_ip()
-    print(f"[INFO] Sender IP: {own_ip}")
+    print(f"[SENDER] My IP: {own_ip}")
+    print(f"[SENDER] Hosting image: {image_path}")
 
-    # ---- UDP BROADCAST: discover receiver ----
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Bind to a specific reply port so we receive unicast replies
-    udp_socket.bind(('', 5002))
-
-    udp_socket.sendto(b"SENDER_AVAILABLE", ('255.255.255.255', DISCOVERY_PORT))
-    print("[BROADCAST] Searching for receiver...")
-
-    udp_socket.settimeout(30)
-
-    receiver_ip = None
+    # ── Read image into memory once ───────────────────────────
     try:
-        while True:
-            data, receiver_addr = udp_socket.recvfrom(1024)
-            reply_ip = receiver_addr[0]
-
-            # *** KEY FIX: ignore replies from ourselves ***
-            if reply_ip == own_ip or reply_ip == "127.0.0.1":
-                print(f"[SKIP] Ignoring reply from own IP: {reply_ip}")
-                continue
-
-            if data == b"RECEIVER_READY":
-                receiver_ip = reply_ip
-                print(f"[FOUND] Receiver at {receiver_ip}")
-                break
-    except socket.timeout:
-        print("[ERROR] No receiver found. Make sure receiver.py is running on the target machine.")
-        udp_socket.close()
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+    except FileNotFoundError:
+        print(f"[SENDER] ERROR: Image file not found: {image_path}")
         return
 
-    udp_socket.close()
-
-    time.sleep(0.5)
-
-    # ---- TCP SEND: transfer the image ----
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((receiver_ip, TCP_PORT))
-
-    with open(image_path, "rb") as f:
-        image_data = f.read()
-
     image_size = len(image_data)
+    print(f"[SENDER] Image size: {image_size} bytes")
 
-    client_socket.sendall(struct.pack("Q", image_size))
-    client_socket.sendall(image_data)
+    # ── Open TCP server ───────────────────────────────────────
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(('', TCP_PORT))
+    server_socket.listen(1)
+    server_socket.settimeout(HOSTING_TIMEOUT)
 
-    print("[SUCCESS] Image sent successfully!")
+    print(f"[SENDER] TCP server ready on port {TCP_PORT}")
 
-    client_socket.close()
+    # ── Broadcast IMAGE_READY in background thread ────────────
+    stop_broadcast = threading.Event()
 
+    def broadcast_loop():
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while not stop_broadcast.is_set():
+            udp.sendto(b"IMAGE_READY", ('255.255.255.255', BROADCAST_PORT))
+            print("[SENDER] Broadcasting IMAGE_READY...")
+            time.sleep(BROADCAST_INTERVAL)
+        udp.close()
 
-if __name__ == "__main__":
-    start_sender("screenshot/screenshot.png")
+    broadcast_thread = threading.Thread(target=broadcast_loop, daemon=True)
+    broadcast_thread.start()
+
+    # ── Wait for receiver to connect ──────────────────────────
+    conn = None
+    try:
+        print(f"[SENDER] Waiting for receiver to connect (timeout: {HOSTING_TIMEOUT}s)...")
+        conn, addr = server_socket.accept()
+        receiver_ip = addr[0]
+        print(f"[SENDER] Receiver connected from {receiver_ip}")
+
+    except socket.timeout:
+        print("[SENDER] TIMEOUT — No receiver connected within 60 seconds. Resetting.")
+        stop_broadcast.set()
+        server_socket.close()
+        return  # ← reset: main.py action_lock will be cleared
+
+    finally:
+        stop_broadcast.set()  # always stop broadcasting once someone connects or timeout
+
+    # ── Send image ────────────────────────────────────────────
+    try:
+        conn.sendall(struct.pack("Q", image_size))
+        conn.sendall(image_data)
+        print("[SENDER] ✅ Image sent successfully!")
+
+    except Exception as e:
+        print(f"[SENDER] ERROR sending image: {e}")
+
+    finally:
+        conn.close()
+        server_socket.close()
+        print("[SENDER] Reset complete — ready for next gesture.")
