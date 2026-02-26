@@ -2,6 +2,7 @@ import socket
 import struct
 import time
 import threading
+from network_utils import get_lan_ip, get_network_status, verify_peer_subnet
 
 BROADCAST_PORT = 5000       # sender broadcasts on this port
 TCP_PORT       = 5001       # sender hosts image on this port
@@ -10,30 +11,27 @@ BROADCAST_INTERVAL = 1.0    # seconds between each broadcast
 HOSTING_TIMEOUT    = 60     # seconds to wait for a receiver before giving up
 
 
-def get_own_ip():
-    """Get this machine's LAN IP address (not loopback)."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-
 def start_sender(image_path):
     """
-    New flow:
+    Flow:
+      0. Verify this machine is on a real WiFi/LAN network
       1. Take screenshot (already done by main.py before calling this)
       2. Open a TCP server to host the image
       3. Broadcast IMAGE_READY repeatedly until a receiver connects
-      4. Send image → close → reset
+      4. Verify receiver is on the same /24 subnet
+      5. Send image → close → reset
     """
 
-    own_ip = get_own_ip()
-    print(f"[SENDER] My IP: {own_ip}")
-    print(f"[SENDER] Hosting image: {image_path}")
+    # ── 0. Network check ──────────────────────────────────────
+    net = get_network_status()
+    own_ip = net["ip"]
+
+    if not net["ok"]:
+        print(f"[SENDER] ❌ Aborted — {net['message']}")
+        return
+
+    print(f"[SENDER] My IP  : {own_ip}  (subnet {net['subnet']}.x)")
+    print(f"[SENDER] Hosting: {image_path}")
 
     # ── Read image into memory once ───────────────────────────
     try:
@@ -72,6 +70,7 @@ def start_sender(image_path):
 
     # ── Wait for receiver to connect ──────────────────────────
     conn = None
+    receiver_ip = None
     try:
         print(f"[SENDER] Waiting for receiver to connect (timeout: {HOSTING_TIMEOUT}s)...")
         conn, addr = server_socket.accept()
@@ -85,13 +84,20 @@ def start_sender(image_path):
         return  # ← reset: main.py action_lock will be cleared
 
     finally:
-        stop_broadcast.set()  # always stop broadcasting once someone connects or timeout
+        stop_broadcast.set()  # always stop broadcasting once someone connects or times out
+
+    # ── Subnet validation ─────────────────────────────────────
+    if not verify_peer_subnet(receiver_ip, own_ip):
+        print("[SENDER] ❌ Receiver is on a DIFFERENT network. Transfer aborted for security.")
+        conn.close()
+        server_socket.close()
+        return
 
     # ── Send image ────────────────────────────────────────────
     try:
         conn.sendall(struct.pack("Q", image_size))
         conn.sendall(image_data)
-        print("[SENDER] ✅ Image sent successfully!")
+        print("✅ [SENDER] Image sent successfully!")
 
     except Exception as e:
         print(f"[SENDER] ERROR sending image: {e}")

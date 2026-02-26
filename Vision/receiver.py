@@ -2,6 +2,7 @@ import socket
 import struct
 import os
 import time
+from network_utils import get_lan_ip, get_network_status, verify_peer_subnet
 
 BROADCAST_PORT  = 5000      # listen for sender's broadcast on this port
 TCP_PORT        = 5001      # connect to sender's TCP server on this port
@@ -12,29 +13,26 @@ SAVE_FOLDER     = "received_screenshot"
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
 
-def get_own_ip():
-    """Get this machine's LAN IP address (not loopback)."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-
 def start_receiver():
     """
-    New flow:
+    Flow:
+      0. Verify this machine is on a real WiFi/LAN network
       1. Listen for sender's IMAGE_READY broadcast
       2. Ignore own broadcasts (self-loopback fix)
-      3. Connect to sender's TCP server
-      4. Pull image → save → open → reset
+      3. Verify sender is on the same /24 subnet
+      4. Connect to sender's TCP server
+      5. Pull image → save → open → reset
     """
 
-    own_ip = get_own_ip()
-    print(f"[RECEIVER] My IP: {own_ip}")
+    # ── 0. Network check ──────────────────────────────────────
+    net = get_network_status()
+    own_ip = net["ip"]
+
+    if not net["ok"]:
+        print(f"[RECEIVER] ❌ Aborted — {net['message']}")
+        return
+
+    print(f"[RECEIVER] My IP  : {own_ip}  (subnet {net['subnet']}.x)")
     print(f"[RECEIVER] Searching for sender broadcast on port {BROADCAST_PORT}...")
 
     # ── UDP: search for sender broadcast ─────────────────────
@@ -55,6 +53,14 @@ def start_receiver():
                 continue
 
             if data == b"IMAGE_READY":
+                # ── Subnet validation ─────────────────────────
+                if not verify_peer_subnet(incoming_ip, own_ip):
+                    print(
+                        f"[RECEIVER] ⚠️  Ignoring sender {incoming_ip} — "
+                        f"different network. Make sure both devices are on the same WiFi."
+                    )
+                    continue   # keep listening in case a same-subnet sender appears
+
                 sender_ip = incoming_ip
                 print(f"[RECEIVER] ✅ Found sender at {sender_ip}")
                 break
