@@ -5,13 +5,12 @@ from receiver import start_receiver
 from sender import start_sender
 from screenshot import ScreenShotManager
 from network_utils import get_network_status
+from peer_discovery import PeerDiscovery
 
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-# Tracks whether a send/receive operation is currently in progress.
-# Prevents triggering a new gesture while one is still running.
 operation_active = False
-operation_status = ""       # shown on camera feed
+operation_status = ""
 operation_lock   = threading.Lock()
 
 
@@ -28,7 +27,7 @@ def run_sender(image_path):
             operation_status = "SEND FAILED"
     finally:
         with operation_lock:
-            operation_active = False   # ← RESET
+            operation_active = False
 
 
 def run_receiver():
@@ -44,8 +43,10 @@ def run_receiver():
             operation_status = "RECEIVE FAILED"
     finally:
         with operation_lock:
-            operation_active = False   # ← RESET
+            operation_active = False
 
+
+# ── Frame overlay helpers ─────────────────────────────────────────────────────
 
 def draw_status(frame, status_text):
     """Draw a status banner at the bottom of the camera frame."""
@@ -54,68 +55,64 @@ def draw_status(frame, status_text):
 
     h, w = frame.shape[:2]
 
-    # Choose colour based on status
     if "DONE" in status_text:
-        colour = (0, 200, 0)        # green
-    elif "FAILED" in status_text or "ERROR" in status_text:
-        colour = (0, 0, 220)        # red
+        colour = (0, 200, 0)
+    elif "FAILED" in status_text or "ERROR" in status_text or "NO WIFI" in status_text:
+        colour = (0, 0, 220)
     else:
-        colour = (0, 165, 255)      # orange = in progress
+        colour = (0, 165, 255)
 
-    # Semi-transparent banner
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h - 50), (w, h), (30, 30, 30), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
-    cv2.putText(frame, status_text,
-                (12, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8, colour, 2)
+    cv2.putText(frame, status_text, (12, h - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
     return frame
 
 
-def draw_network_badge(frame, net_status: dict):
+def draw_network_badge(frame, net_status: dict, peer_count: int):
     """
-    Draw a small WiFi/network badge in the top-right corner of the frame.
-
-    Green  = connected to a LAN/WiFi network  (safe to use gestures)
-    Red    = no network / loopback only        (gestures are blocked)
+    Top banner showing:
+      • WiFi status  (green = connected, red = no network)
+      • Number of GestureDrop peers currently discovered on the LAN
     """
     h, w = frame.shape[:2]
+    ok     = net_status["ok"]
+    colour = (0, 220, 0) if ok else (0, 0, 220)
+    bg     = (20, 60, 20) if ok else (20, 20, 80)
 
-    ok      = net_status["ok"]
-    label   = net_status["message"]
-    colour  = (0, 200, 0) if ok else (0, 0, 220)   # green / red (BGR)
-    bg      = (20, 60, 20) if ok else (20, 20, 80)
-
-    # Badge background
-    badge_h = 28
+    badge_h = 32
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, badge_h), bg, -1)
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    # WiFi icon text prefix
-    prefix = "[WiFi OK]" if ok else "[NO WIFI]"
-    text   = f"{prefix}  {label}"
+    wifi_tag  = "[WiFi OK]" if ok else "[NO WIFI]"
+    peer_tag  = f"| Peers: {peer_count}" if ok else ""
+    ip_tag    = f"| {net_status['ip']}" if ok else ""
+    text      = f"{wifi_tag}  {ip_tag}  {peer_tag}"
 
-    cv2.putText(frame, text,
-                (10, badge_h - 7),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55, colour, 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (10, badge_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 1, cv2.LINE_AA)
     return frame
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     global operation_active, operation_status
+
+    # ── Start peer discovery before anything else ─────────────
+    discovery = PeerDiscovery()
+    discovery.start()
 
     cap = cv2.VideoCapture(0)
     detector = GestureDetector()
     screenshot_manager = ScreenShotManager()
 
-    # Refresh network status every 5 seconds so the badge stays current
-    net_status = get_network_status()
+    # Network status — refresh every ~5 s (150 frames @ ~30 fps)
+    net_status        = get_network_status()
     net_check_counter = 0
-    NET_CHECK_INTERVAL = 150   # ~5 s at 30 fps
+    NET_CHECK_INTERVAL = 150
 
     print(f"[MAIN] Network: {net_status['message']}")
 
@@ -132,8 +129,6 @@ def main():
         if net_check_counter >= NET_CHECK_INTERVAL:
             net_status = get_network_status()
             net_check_counter = 0
-            if not net_status["ok"]:
-                print(f"[MAIN] ⚠️  Network lost — {net_status['message']}")
 
         with operation_lock:
             active = operation_active
@@ -142,44 +137,32 @@ def main():
         # ── Handle gesture actions ────────────────────────────
         if action and not active:
 
-            # Block gestures when there is no network
             if not net_status["ok"]:
                 print("[MAIN] ⚠️  Gesture blocked — not connected to a WiFi / LAN network.")
                 with operation_lock:
                     operation_status = "NO WIFI — Connect first!"
+
             elif action == "SEND":
-                # Step 1: take screenshot immediately
                 file_path = screenshot_manager.capture_and_save()
                 print(f"[MAIN] SEND triggered — screenshot: {file_path}")
-
-                # Step 2: start hosting + broadcasting in background
                 with operation_lock:
                     operation_active = True
                     operation_status = "HOSTING — waiting for receiver..."
-
-                threading.Thread(
-                    target=run_sender,
-                    args=(file_path,),
-                    daemon=True
-                ).start()
+                threading.Thread(target=run_sender, args=(file_path,), daemon=True).start()
 
             elif action == "RECEIVE":
                 print("[MAIN] RECEIVE triggered — searching for sender...")
-
                 with operation_lock:
                     operation_active = True
                     operation_status = "SEARCHING for sender..."
-
-                threading.Thread(
-                    target=run_receiver,
-                    daemon=True
-                ).start()
+                threading.Thread(target=run_receiver, daemon=True).start()
 
         elif action and active:
             print(f"[MAIN] Gesture '{action}' ignored — operation already in progress.")
 
-        # ── Draw overlays on frame ────────────────────────────
-        frame = draw_network_badge(frame, net_status)
+        # ── Draw overlays ─────────────────────────────────────
+        peer_count = discovery.peer_count
+        frame = draw_network_badge(frame, net_status, peer_count)
         frame = draw_status(frame, status)
 
         cv2.imshow("GestureDrop", frame)
@@ -187,6 +170,8 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    # ── Cleanup ───────────────────────────────────────────────
+    discovery.stop()
     cap.release()
     cv2.destroyAllWindows()
 
