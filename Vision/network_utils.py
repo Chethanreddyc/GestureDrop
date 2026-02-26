@@ -25,17 +25,30 @@ import ipaddress
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def get_lan_ip() -> str:
-    """Return this machine's LAN IP (not 127.x loopback)."""
+    """
+    Return this machine's real LAN IP.
+    Skips loopback (127.x) and APIPA/VMware virtual adapters (169.254.x).
+    """
     try:
-        # Trick: open a UDP socket toward a public address (doesn't actually send)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        # Reject APIPA (VMware VMnet, VPN virtual adapters) and loopback
+        if not ip.startswith("169.254.") and not ip.startswith("127."):
+            return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+    # Fallback: scan all host IPs and return first real one
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("169.254.") and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
 
 
 def get_subnet_prefix(ip: str) -> str:

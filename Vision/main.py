@@ -14,11 +14,11 @@ operation_status = ""
 operation_lock   = threading.Lock()
 
 
-def run_sender(image_path):
-    """Wrapper: runs start_sender and resets state when done."""
+def run_sender(image_path, peer_ip=None):
+    """Wrapper: runs start_sender with known peer IP and resets state when done."""
     global operation_active, operation_status
     try:
-        start_sender(image_path)
+        start_sender(image_path, peer_ip=peer_ip)
         with operation_lock:
             operation_status = "SEND DONE"
     except Exception as e:
@@ -144,11 +144,20 @@ def main():
 
             elif action == "SEND":
                 file_path = screenshot_manager.capture_and_save()
-                print(f"[MAIN] SEND triggered — screenshot: {file_path}")
-                with operation_lock:
-                    operation_active = True
-                    operation_status = "HOSTING — waiting for receiver..."
-                threading.Thread(target=run_sender, args=(file_path,), daemon=True).start()
+                # Pick best peer from live discovery
+                best = discovery.best_peer()
+                peer_ip = best["ip"] if best else None
+                if peer_ip:
+                    print(f"[MAIN] SEND triggered -> {peer_ip} ({best['hostname']})")
+                    with operation_lock:
+                        operation_active = True
+                        operation_status = f"SENDING to {best['hostname']}..."
+                else:
+                    print(f"[MAIN] SEND triggered — no peer yet, broadcasting...")
+                    with operation_lock:
+                        operation_active = True
+                        operation_status = "HOSTING — waiting for receiver..."
+                threading.Thread(target=run_sender, args=(file_path, peer_ip), daemon=True).start()
 
             elif action == "RECEIVE":
                 print("[MAIN] RECEIVE triggered — searching for sender...")
