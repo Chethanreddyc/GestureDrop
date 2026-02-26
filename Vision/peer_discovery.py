@@ -46,9 +46,9 @@ import time
 # ── Config ────────────────────────────────────────────────────────────────────
 DISCOVERY_PORT     = 5005        # UDP port for heartbeat & probe
 HEARTBEAT_INTERVAL = 2.0         # seconds between broadcasts
-PEER_TIMEOUT       = 10.0        # seconds before a peer is considered gone
-PROBE_INTERVAL     = 12.0        # seconds between full subnet probe scans
-PROBE_TIMEOUT      = 0.4         # seconds per IP during probing
+PEER_TIMEOUT       = 20.0        # seconds before a peer is considered gone
+PROBE_INTERVAL     = 8.0         # seconds between full subnet probe scans
+PROBE_TIMEOUT      = 0.5         # seconds per IP during probing
 PROBE_BATCH        = 40          # parallel threads per probe batch
 HELLO_HEADER       = b"GESTUREDROP_HELLO"
 PROBE_MSG          = b"GESTUREDROP_PROBE"

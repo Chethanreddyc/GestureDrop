@@ -1,7 +1,7 @@
 import cv2
 import threading
 from gesture import GestureDetector
-from receiver import start_receiver
+from receiver import start_background_receiver, stop_background_receiver
 from sender import start_sender
 from screenshot import ScreenShotManager
 from network_utils import get_network_status
@@ -25,22 +25,6 @@ def run_sender(image_path, peer_ip=None):
         print(f"[MAIN] Sender error: {e}")
         with operation_lock:
             operation_status = "SEND FAILED"
-    finally:
-        with operation_lock:
-            operation_active = False
-
-
-def run_receiver():
-    """Wrapper: runs start_receiver and resets state when done."""
-    global operation_active, operation_status
-    try:
-        start_receiver()
-        with operation_lock:
-            operation_status = "RECEIVE DONE"
-    except Exception as e:
-        print(f"[MAIN] Receiver error: {e}")
-        with operation_lock:
-            operation_status = "RECEIVE FAILED"
     finally:
         with operation_lock:
             operation_active = False
@@ -101,9 +85,10 @@ def draw_network_badge(frame, net_status: dict, peer_count: int):
 def main():
     global operation_active, operation_status
 
-    # ── Start peer discovery before anything else ─────────────
+    # ── Start peer discovery + background receiver ──────────────
     discovery = PeerDiscovery()
     discovery.start()
+    start_background_receiver()   # always-on TCP server, no gesture needed
 
     cap = cv2.VideoCapture(0)
     detector = GestureDetector()
@@ -143,28 +128,22 @@ def main():
                     operation_status = "NO WIFI — Connect first!"
 
             elif action == "SEND":
-                file_path = screenshot_manager.capture_and_save()
-                # Pick best peer from live discovery
                 best = discovery.best_peer()
-                peer_ip = best["ip"] if best else None
-                if peer_ip:
-                    print(f"[MAIN] SEND triggered -> {peer_ip} ({best['hostname']})")
+                if not best:
+                    print("[MAIN] SEND gesture — no peer discovered yet, ignoring.")
                     with operation_lock:
-                        operation_active = True
-                        operation_status = f"SENDING to {best['hostname']}..."
+                        operation_status = "NO PEER — wait for discovery..."
                 else:
-                    print(f"[MAIN] SEND triggered — no peer yet, broadcasting...")
+                    peer_ip   = best["ip"]
+                    peer_name = best["hostname"]
+                    file_path = screenshot_manager.capture_and_save()
+                    print(f"[MAIN] SEND triggered -> {peer_ip} ({peer_name})")
                     with operation_lock:
                         operation_active = True
-                        operation_status = "HOSTING — waiting for receiver..."
-                threading.Thread(target=run_sender, args=(file_path, peer_ip), daemon=True).start()
-
-            elif action == "RECEIVE":
-                print("[MAIN] RECEIVE triggered — searching for sender...")
-                with operation_lock:
-                    operation_active = True
-                    operation_status = "SEARCHING for sender..."
-                threading.Thread(target=run_receiver, daemon=True).start()
+                        operation_status = f"SENDING to {peer_name}..."
+                    threading.Thread(
+                        target=run_sender, args=(file_path, peer_ip), daemon=True
+                    ).start()
 
         elif action and active:
             print(f"[MAIN] Gesture '{action}' ignored — operation already in progress.")
@@ -181,6 +160,7 @@ def main():
 
     # ── Cleanup ───────────────────────────────────────────────
     discovery.stop()
+    stop_background_receiver()
     cap.release()
     cv2.destroyAllWindows()
 
